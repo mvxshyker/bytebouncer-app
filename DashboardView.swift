@@ -109,6 +109,8 @@ struct DashboardView: View {
     @State private var packetsScanned: Int = 1240592
     @State private var packetsGuarded: Int = 342108
     
+    @State private var isInternalUpdate: Bool = false
+    
     let timer = Timer.publish(every: 0.6, on: .main, in: .common).autoconnect()
     
     init(viewModel: DashboardViewModel) {
@@ -204,8 +206,32 @@ struct DashboardView: View {
                 .padding(.bottom, 32)
                 
                 // Toggle
-                MassiveToggle(isActive: $isFirewallActive)
-                    .padding(.bottom, 24)
+                MassiveToggle(isActive: Binding(
+                    get: { isFirewallActive },
+                    set: { newValue in
+                        isInternalUpdate = true
+                        isFirewallActive = newValue
+                        
+                        if newValue {
+                            // Turn ON everything if it was OFF
+                            Task {
+                                await viewModel.toggleSocialMedia(blocked: true)
+                                await viewModel.toggleAnalytics(blocked: true)
+                                await viewModel.toggleAdvertising(blocked: true)
+                                isInternalUpdate = false
+                            }
+                        } else {
+                            // Turn OFF everything
+                            Task {
+                                await viewModel.toggleSocialMedia(blocked: false)
+                                await viewModel.toggleAnalytics(blocked: false)
+                                await viewModel.toggleAdvertising(blocked: false)
+                                isInternalUpdate = false
+                            }
+                        }
+                    }
+                ))
+                .padding(.bottom, 24)
                 
                 HStack(spacing: 8) {
                     Image(systemName: isFirewallActive ? "shield.checkerboard.fill" : "exclamationmark.triangle")
@@ -227,28 +253,43 @@ struct DashboardView: View {
                     FilterRow(
                         title: "Social Media Prefetch",
                         description: "Blocks auto-playing videos & preloading",
-                        checked: $viewModel.isSocialMediaBlocked,
-                        onChange: { newValue in
-                            Task { await viewModel.toggleSocialMedia(blocked: newValue) }
-                        }
+                        checked: Binding(
+                            get: { viewModel.isSocialMediaBlocked },
+                            set: { newValue in
+                                if !isInternalUpdate {
+                                    Task { await viewModel.toggleSocialMedia(blocked: newValue) }
+                                }
+                            }
+                        ),
+                        onChange: { _ in } // Ignored as logic is in binding
                     )
                     
                     FilterRow(
                         title: "Analytics & Crash Reports",
                         description: "Stops background telemetry to servers",
-                        checked: $viewModel.isAnalyticsBlocked,
-                        onChange: { newValue in
-                            Task { await viewModel.toggleAnalytics(blocked: newValue) }
-                        }
+                        checked: Binding(
+                            get: { viewModel.isAnalyticsBlocked },
+                            set: { newValue in
+                                if !isInternalUpdate {
+                                    Task { await viewModel.toggleAnalytics(blocked: newValue) }
+                                }
+                            }
+                        ),
+                        onChange: { _ in }
                     )
                     
                     FilterRow(
                         title: "Advertising Networks",
                         description: "Blocks ad tracking domains and scripts",
-                        checked: $viewModel.isAdvertisingBlocked,
-                        onChange: { newValue in
-                            Task { await viewModel.toggleAdvertising(blocked: newValue) }
-                        }
+                        checked: Binding(
+                            get: { viewModel.isAdvertisingBlocked },
+                            set: { newValue in
+                                if !isInternalUpdate {
+                                    Task { await viewModel.toggleAdvertising(blocked: newValue) }
+                                }
+                            }
+                        ),
+                        onChange: { _ in }
                     )
                 }
                 .padding(.horizontal, 24)
@@ -262,40 +303,16 @@ struct DashboardView: View {
                 packetsGuarded += Int.random(in: 0...5)
             }
         }
-        .onChange(of: isFirewallActive, perform: { newValue in
-            if newValue {
-                // Master turned ON
-                if !viewModel.isSocialMediaBlocked && !viewModel.isAnalyticsBlocked && !viewModel.isAdvertisingBlocked {
-                    Task {
-                        await viewModel.toggleSocialMedia(blocked: true)
-                        await viewModel.toggleAnalytics(blocked: true)
-                        await viewModel.toggleAdvertising(blocked: true)
-                    }
-                }
-            } else {
-                // Master turned OFF
-                if viewModel.isSocialMediaBlocked || viewModel.isAnalyticsBlocked || viewModel.isAdvertisingBlocked {
-                    Task {
-                        if viewModel.isSocialMediaBlocked { await viewModel.toggleSocialMedia(blocked: false) }
-                        if viewModel.isAnalyticsBlocked { await viewModel.toggleAnalytics(blocked: false) }
-                        if viewModel.isAdvertisingBlocked { await viewModel.toggleAdvertising(blocked: false) }
-                    }
-                }
-            }
-        })
-        .onChange(of: viewModel.isSocialMediaBlocked, perform: { _ in checkFirewallState() })
-        .onChange(of: viewModel.isAnalyticsBlocked, perform: { _ in checkFirewallState() })
-        .onChange(of: viewModel.isAdvertisingBlocked, perform: { _ in checkFirewallState() })
+        .onChange(of: viewModel.isSocialMediaBlocked) { _ in checkFirewallState() }
+        .onChange(of: viewModel.isAnalyticsBlocked) { _ in checkFirewallState() }
+        .onChange(of: viewModel.isAdvertisingBlocked) { _ in checkFirewallState() }
         .onAppear {
             self.isFirewallActive = viewModel.isSocialMediaBlocked || viewModel.isAnalyticsBlocked || viewModel.isAdvertisingBlocked
-            // Provide a default active state if this is the first deep run
-            if !self.isFirewallActive {
-                self.isFirewallActive = true
-            }
         }
     }
     
     private func checkFirewallState() {
+        if isInternalUpdate { return }
         let anyActive = viewModel.isSocialMediaBlocked || viewModel.isAnalyticsBlocked || viewModel.isAdvertisingBlocked
         if anyActive && !isFirewallActive {
             isFirewallActive = true
