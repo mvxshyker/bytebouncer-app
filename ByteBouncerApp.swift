@@ -3,17 +3,20 @@ import SwiftUI
 @main
 struct ByteBouncerApp: App {
     @AppStorage("isOnboardingComplete") private var isOnboardingComplete: Bool = false
-    @AppStorage("profileID") private var profileID: String = ""
-    @AppStorage("apiKey") private var apiKey: String = ""
+
+    // TODO: Replace with your actual backend URL and app token
+    private let baseURL = "https://api.yourdomain.com"
+    private let appToken = "YOUR_APP_TOKEN_HERE"
 
     var body: some Scene {
         WindowGroup {
-            if isOnboardingComplete {
-                let networkManager = NextDNSNetworkManager(profileID: profileID, apiKey: apiKey)
-                let viewModel = DashboardViewModel(networkManager: networkManager)
+            if isOnboardingComplete, let deviceID = KeychainHelper.read(key: "device_id") {
+                let apiClient = APIClient(baseURL: baseURL, appToken: appToken)
+                let viewModel = DashboardViewModel(apiClient: apiClient, deviceID: deviceID)
                 DashboardView(viewModel: viewModel)
             } else {
-                OnboardingView()
+                let apiClient = APIClient(baseURL: baseURL, appToken: appToken)
+                OnboardingView(apiClient: apiClient)
             }
         }
     }

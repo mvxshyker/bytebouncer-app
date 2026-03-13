@@ -17,7 +17,7 @@ class MockURLProtocol: URLProtocol {
         guard let handler = MockURLProtocol.requestHandler else {
             fatalError("Handler is unavailable.")
         }
-        
+
         do {
             let (response, data) = try handler(request)
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -33,161 +33,166 @@ class MockURLProtocol: URLProtocol {
     override func stopLoading() {}
 }
 
-final class NextDNSNetworkManagerTests: XCTestCase {
-    var networkManager: NextDNSNetworkManager!
+final class APIClientTests: XCTestCase {
+    var apiClient: APIClient!
     var session: URLSession!
-    
-    let profileID = "testProfileID"
-    let apiKey = "testApiKey"
+
+    let baseURL = "https://api.test.com"
+    let appToken = "test-token"
+    let deviceID = "test-device-id"
 
     override func setUpWithError() throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
         session = URLSession(configuration: configuration)
-        networkManager = NextDNSNetworkManager(session: session, profileID: profileID, apiKey: apiKey)
+        apiClient = APIClient(session: session, baseURL: baseURL, appToken: appToken)
     }
 
     override func tearDownWithError() throws {
-        networkManager = nil
+        apiClient = nil
         session = nil
         MockURLProtocol.requestHandler = nil
     }
 
-    // MARK: - API Key Validation Tests
-    func testAPIKeyHeaderIsPresent() async throws {
+    // MARK: - Auth Header Tests
+
+    func testAppTokenHeaderIsPresent() async throws {
+        let responseBody = try JSONEncoder().encode(SettingsResponse(ok: true))
         MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.value(forHTTPHeaderField: "X-Api-Key"), self.apiKey)
+            XCTAssertEqual(request.value(forHTTPHeaderField: "X-App-Token"), self.appToken)
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
+            return (response, responseBody)
         }
-        
-        _ = try await networkManager.toggleService(serviceId: "instagram", enabled: true)
+
+        _ = try await apiClient.toggleServices(deviceID: deviceID, enabled: true)
     }
-    
-    // MARK: - Unauthorized Test
+
     func testUnauthorizedError() async throws {
         MockURLProtocol.requestHandler = { request in
             let response = HTTPURLResponse(url: request.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!
             return (response, nil)
         }
-        
+
         do {
-            _ = try await networkManager.toggleService(serviceId: "instagram", enabled: true)
+            _ = try await apiClient.toggleServices(deviceID: deviceID, enabled: true)
             XCTFail("Expected unauthorized error to be thrown")
-        } catch NextDNSError.unauthorized {
+        } catch APIError.unauthorized {
             // Success
         } catch {
             XCTFail("Unexpected error thrown: \(error)")
         }
     }
 
-    // MARK: - Social Media Prefetch (Parental Controls)
-    func testEnableSocialMediaBlock() async throws {
-        let serviceId = "instagram"
-        
+    // MARK: - Onboard
+
+    func testOnboard() async throws {
+        let expected = OnboardResponse(dohURL: "https://dns.nextdns.io/abc123")
+        let responseBody = try JSONEncoder().encode(expected)
+
         MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/parentalcontrol/services")
+            XCTAssertEqual(request.url?.absoluteString, "\(self.baseURL)/api/onboard")
             XCTAssertEqual(request.httpMethod, "POST")
-            
-            // Validate body
+
             if let data = request.httpBody ?? request.httpBodyStream?.readData(),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                XCTAssertEqual(json["id"], serviceId)
+                XCTAssertEqual(json["device_id"], self.deviceID)
             } else {
-                XCTFail("Expected HTTP body")
+                XCTFail("Expected HTTP body with device_id")
             }
-            
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
+
+            let response = HTTPURLResponse(url: request.url!, statusCode: 201, httpVersion: nil, headerFields: nil)!
+            return (response, responseBody)
         }
-        
-        try await networkManager.toggleService(serviceId: serviceId, enabled: true)
-    }
-    
-    func testDisableSocialMediaBlock() async throws {
-        let serviceId = "instagram"
-        
-        MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/parentalcontrol/services/\(serviceId)")
-            XCTAssertEqual(request.httpMethod, "DELETE")
-            
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
-        }
-        
-        try await networkManager.toggleService(serviceId: serviceId, enabled: false)
+
+        let result = try await apiClient.onboard(deviceID: deviceID)
+        XCTAssertEqual(result.dohURL, "https://dns.nextdns.io/abc123")
     }
 
-    // MARK: - Analytics & Crash Reports (Native Tracking Protection)
-    func testEnableNativeTrackingBlock() async throws {
-        let nativeId = "apple"
-        
+    // MARK: - Analytics
+
+    func testFetchAnalytics() async throws {
+        let expected = AnalyticsResponse(
+            totalBlocked: 1500,
+            topDomains: [BlockedDomain(name: "ads.example.com", queries: 340)]
+        )
+        let responseBody = try JSONEncoder().encode(expected)
+
         MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/privacy/natives")
-            XCTAssertEqual(request.httpMethod, "POST")
-            
-            if let data = request.httpBody ?? request.httpBodyStream?.readData(),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                XCTAssertEqual(json["id"], nativeId)
-            } else {
-                XCTFail("Expected HTTP body")
-            }
-            
+            XCTAssertTrue(request.url?.absoluteString.contains("/api/analytics") ?? false)
+            XCTAssertTrue(request.url?.absoluteString.contains("device_id=\(self.deviceID)") ?? false)
+            XCTAssertEqual(request.httpMethod, "GET")
+
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
+            return (response, responseBody)
         }
-        
-        try await networkManager.toggleNativeTracking(nativeId: nativeId, enabled: true)
-    }
-    
-    func testDisableNativeTrackingBlock() async throws {
-        let nativeId = "apple"
-        
-        MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/privacy/natives/\(nativeId)")
-            XCTAssertEqual(request.httpMethod, "DELETE")
-            
-            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
-        }
-        
-        try await networkManager.toggleNativeTracking(nativeId: nativeId, enabled: false)
+
+        let result = try await apiClient.fetchAnalytics(deviceID: deviceID)
+        XCTAssertEqual(result.totalBlocked, 1500)
+        XCTAssertEqual(result.topDomains.count, 1)
+        XCTAssertEqual(result.topDomains.first?.name, "ads.example.com")
     }
 
-    // MARK: - Advertising Networks (Blocklists)
-    func testEnableAdGuardBlocklist() async throws {
-        let blocklistId = "adguard"
-        
+    // MARK: - Settings Toggles
+
+    func testToggleServices() async throws {
+        let responseBody = try JSONEncoder().encode(SettingsResponse(ok: true))
+
         MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/privacy/blocklists")
-            XCTAssertEqual(request.httpMethod, "POST")
-            
-            if let data = request.httpBody ?? request.httpBodyStream?.readData(),
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
-                XCTAssertEqual(json["id"], blocklistId)
-            } else {
-                XCTFail("Expected HTTP body")
-            }
-            
+            XCTAssertEqual(request.url?.absoluteString, "\(self.baseURL)/api/settings/services")
+            XCTAssertEqual(request.httpMethod, "PATCH")
+
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, nil)
+            return (response, responseBody)
         }
-        
-        try await networkManager.toggleBlocklist(blocklistId: blocklistId, enabled: true)
+
+        let result = try await apiClient.toggleServices(deviceID: deviceID, enabled: true)
+        XCTAssertTrue(result.ok)
     }
-    
-    func testDisableAdGuardBlocklist() async throws {
-        let blocklistId = "adguard"
-        
+
+    func testToggleNatives() async throws {
+        let responseBody = try JSONEncoder().encode(SettingsResponse(ok: true))
+
         MockURLProtocol.requestHandler = { request in
-            XCTAssertEqual(request.url?.absoluteString, "https://api.nextdns.io/profiles/\(self.profileID)/privacy/blocklists/\(blocklistId)")
-            XCTAssertEqual(request.httpMethod, "DELETE")
-            
+            XCTAssertEqual(request.url?.absoluteString, "\(self.baseURL)/api/settings/natives")
+            XCTAssertEqual(request.httpMethod, "PATCH")
+
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, responseBody)
+        }
+
+        let result = try await apiClient.toggleNatives(deviceID: deviceID, enabled: true)
+        XCTAssertTrue(result.ok)
+    }
+
+    func testToggleBlocklists() async throws {
+        let responseBody = try JSONEncoder().encode(SettingsResponse(ok: true))
+
+        MockURLProtocol.requestHandler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "\(self.baseURL)/api/settings/blocklists")
+            XCTAssertEqual(request.httpMethod, "PATCH")
+
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, responseBody)
+        }
+
+        let result = try await apiClient.toggleBlocklists(deviceID: deviceID, enabled: false)
+        XCTAssertTrue(result.ok)
+    }
+
+    func testBadStatusCodeError() async throws {
+        MockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!
             return (response, nil)
         }
-        
-        try await networkManager.toggleBlocklist(blocklistId: blocklistId, enabled: false)
+
+        do {
+            _ = try await apiClient.toggleServices(deviceID: deviceID, enabled: true)
+            XCTFail("Expected bad status code error")
+        } catch APIError.badStatusCode(let code) {
+            XCTAssertEqual(code, 500)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
     }
 }
 
