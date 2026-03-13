@@ -2,12 +2,15 @@ package handlers
 
 import (
 	"fmt"
+	"log"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/mvxshyker/bytebouncer-backend/database"
 	"github.com/mvxshyker/bytebouncer-backend/services"
 )
+
+const maxDeviceIDLen = 256
 
 type onboardRequest struct {
 	DeviceID string `json:"device_id"`
@@ -19,8 +22,11 @@ func Onboard(db *database.Pool) fiber.Handler {
 		if err := c.BodyParser(&req); err != nil || req.DeviceID == "" {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id required"})
 		}
+		if len(req.DeviceID) > maxDeviceIDLen {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id too long"})
+		}
 
-		// Idempotent: return existing profile if already onboarded
+		// Fast path: return existing profile if already onboarded
 		existing, err := database.GetUserByDeviceID(c.Context(), db, req.DeviceID)
 		if err == nil {
 			return c.JSON(fiber.Map{"doh_url": dohURL(existing.ProfileID)})
@@ -29,22 +35,25 @@ func Onboard(db *database.Pool) fiber.Handler {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "db error"})
 		}
 
-		profileID, err := services.CreateProfile()
+		profileID, err := services.CreateProfile(c.Context())
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to create nextdns profile"})
 		}
 
 		// Enable OISD blocklist by default
-		if err := services.EnableBlocklist(profileID, "oisd"); err != nil {
-			// Non-fatal: log and continue
-			c.Context().Logger().Printf("warn: enable oisd: %v", err)
+		if err := services.EnableBlocklist(c.Context(), profileID, "oisd"); err != nil {
+			log.Printf("warn: enable oisd for %s: %v", profileID, err)
 		}
 
-		if err := database.CreateUser(c.Context(), db, req.DeviceID, profileID); err != nil {
+		// Upsert handles the TOCTOU race: if another request already inserted
+		// this device_id, we get back the existing profile_id (the one we just
+		// created becomes orphaned — acceptable at this scale vs. distributed locking).
+		savedProfileID, err := database.UpsertUser(c.Context(), db, req.DeviceID, profileID)
+		if err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "db error"})
 		}
 
-		return c.Status(fiber.StatusCreated).JSON(fiber.Map{"doh_url": dohURL(profileID)})
+		return c.Status(fiber.StatusCreated).JSON(fiber.Map{"doh_url": dohURL(savedProfileID)})
 	}
 }
 

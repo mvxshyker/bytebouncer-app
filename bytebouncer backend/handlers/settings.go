@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"log"
+
 	"github.com/gofiber/fiber/v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/mvxshyker/bytebouncer-backend/database"
@@ -12,39 +14,37 @@ type settingsRequest struct {
 	Enabled  bool   `json:"enabled"`
 }
 
-// lookupProfile is a shared helper: parse body, find profile, return (profileID, error response sent).
-func lookupProfile(c *fiber.Ctx, db *database.Pool) (string, bool) {
+// lookupProfile parses the request body and resolves the NextDNS profile ID.
+func lookupProfile(c *fiber.Ctx, db *database.Pool) (profileID string, enabled bool, ok bool) {
 	var req settingsRequest
 	if err := c.BodyParser(&req); err != nil || req.DeviceID == "" {
 		c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "device_id required"})
-		return "", false
+		return "", false, false
 	}
 	user, err := database.GetUserByDeviceID(c.Context(), db, req.DeviceID)
 	if err == pgx.ErrNoRows {
 		c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "device not found"})
-		return "", false
+		return "", false, false
 	}
 	if err != nil {
 		c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "db error"})
-		return "", false
+		return "", false, false
 	}
-	_ = req // enabled is read again per handler — store it on context via Locals
-	c.Locals("enabled", req.Enabled)
-	return user.ProfileID, true
+	return user.ProfileID, req.Enabled, true
 }
 
 // SettingsServices toggles social media blocking (instagram, tiktok, youtube, facebook).
 func SettingsServices(db *database.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		profileID, ok := lookupProfile(c, db)
+		profileID, enabled, ok := lookupProfile(c, db)
 		if !ok {
 			return nil
 		}
-		enabled := c.Locals("enabled").(bool)
 		ids := []string{"instagram", "tiktok", "youtube", "facebook"}
 		for _, id := range ids {
-			if err := services.Toggle(profileID, "parentalcontrol/services", id, enabled); err != nil {
-				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "nextdns error: " + err.Error()})
+			if err := services.Toggle(c.Context(), profileID, "parentalcontrol/services", id, enabled); err != nil {
+				log.Printf("error: toggle services/%s: %v", id, err)
+				return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to update settings"})
 			}
 		}
 		return c.JSON(fiber.Map{"ok": true})
@@ -54,13 +54,13 @@ func SettingsServices(db *database.Pool) fiber.Handler {
 // SettingsNatives toggles analytics/crash reporting (apple).
 func SettingsNatives(db *database.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		profileID, ok := lookupProfile(c, db)
+		profileID, enabled, ok := lookupProfile(c, db)
 		if !ok {
 			return nil
 		}
-		enabled := c.Locals("enabled").(bool)
-		if err := services.Toggle(profileID, "privacy/natives", "apple", enabled); err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "nextdns error: " + err.Error()})
+		if err := services.Toggle(c.Context(), profileID, "privacy/natives", "apple", enabled); err != nil {
+			log.Printf("error: toggle natives/apple: %v", err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to update settings"})
 		}
 		return c.JSON(fiber.Map{"ok": true})
 	}
@@ -69,13 +69,13 @@ func SettingsNatives(db *database.Pool) fiber.Handler {
 // SettingsBlocklists toggles ad network blocking (adguard).
 func SettingsBlocklists(db *database.Pool) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		profileID, ok := lookupProfile(c, db)
+		profileID, enabled, ok := lookupProfile(c, db)
 		if !ok {
 			return nil
 		}
-		enabled := c.Locals("enabled").(bool)
-		if err := services.Toggle(profileID, "privacy/blocklists", "adguard", enabled); err != nil {
-			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "nextdns error: " + err.Error()})
+		if err := services.Toggle(c.Context(), profileID, "privacy/blocklists", "adguard", enabled); err != nil {
+			log.Printf("error: toggle blocklists/adguard: %v", err)
+			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to update settings"})
 		}
 		return c.JSON(fiber.Map{"ok": true})
 	}

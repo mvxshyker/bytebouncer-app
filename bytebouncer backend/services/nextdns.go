@@ -2,18 +2,22 @@ package services
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"time"
 )
 
 const baseURL = "https://api.nextdns.io"
 
+var client = &http.Client{Timeout: 10 * time.Second}
+
 func apiKey() string { return os.Getenv("NEXTDNS_API_KEY") }
 
-func do(method, path string, body any) ([]byte, int, error) {
+func do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
 	var r io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -22,7 +26,7 @@ func do(method, path string, body any) ([]byte, int, error) {
 		}
 		r = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, baseURL+path, r)
+	req, err := http.NewRequestWithContext(ctx, method, baseURL+path, r)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -30,23 +34,26 @@ func do(method, path string, body any) ([]byte, int, error) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, fmt.Errorf("reading response body: %w", err)
+	}
 	return data, resp.StatusCode, nil
 }
 
 // CreateProfile creates a new NextDNS profile and returns its ID.
-func CreateProfile() (string, error) {
-	data, status, err := do("POST", "/profiles", map[string]any{})
+func CreateProfile(ctx context.Context) (string, error) {
+	data, status, err := do(ctx, "POST", "/profiles", map[string]any{})
 	if err != nil {
 		return "", err
 	}
 	if status != 200 && status != 201 {
-		return "", fmt.Errorf("nextdns create profile: status %d: %s", status, data)
+		return "", fmt.Errorf("nextdns create profile: status %d", status)
 	}
 	var resp struct {
 		Data struct {
@@ -60,8 +67,8 @@ func CreateProfile() (string, error) {
 }
 
 // EnableBlocklist enables a blocklist on a profile (e.g. "oisd").
-func EnableBlocklist(profileID, listID string) error {
-	_, status, err := do("POST", fmt.Sprintf("/profiles/%s/privacy/blocklists", profileID),
+func EnableBlocklist(ctx context.Context, profileID, listID string) error {
+	_, status, err := do(ctx, "POST", fmt.Sprintf("/profiles/%s/privacy/blocklists", profileID),
 		map[string]string{"id": listID})
 	if err != nil {
 		return err
@@ -84,63 +91,95 @@ type Domain struct {
 }
 
 // GetAnalytics fetches blocked count + top blocked domains for last 24h.
-func GetAnalytics(profileID string) (*Analytics, error) {
-	// Status summary
-	statusData, statusCode, err := do("GET",
-		fmt.Sprintf("/profiles/%s/analytics/status?from=-24h", profileID), nil)
-	if err != nil {
-		return nil, err
+func GetAnalytics(ctx context.Context, profileID string) (*Analytics, error) {
+	type statusResult struct {
+		blocked int
+		err     error
 	}
-	if statusCode != 200 {
-		return nil, fmt.Errorf("nextdns analytics status: %d: %s", statusCode, statusData)
-	}
-	var statusResp struct {
-		Data struct {
-			Blocked int `json:"blocked"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(statusData, &statusResp); err != nil {
-		return nil, err
+	type domainResult struct {
+		domains []Domain
+		err     error
 	}
 
-	// Top blocked domains
-	domainData, domainCode, err := do("GET",
-		fmt.Sprintf("/profiles/%s/analytics/domains?from=-24h&status=blocked&limit=10", profileID), nil)
-	if err != nil {
-		return nil, err
+	statusCh := make(chan statusResult, 1)
+	domainCh := make(chan domainResult, 1)
+
+	// Parallel: fetch status + domains concurrently
+	go func() {
+		data, code, err := do(ctx, "GET",
+			fmt.Sprintf("/profiles/%s/analytics/status?from=-24h", profileID), nil)
+		if err != nil {
+			statusCh <- statusResult{err: err}
+			return
+		}
+		if code != 200 {
+			statusCh <- statusResult{err: fmt.Errorf("nextdns analytics status: %d", code)}
+			return
+		}
+		var resp struct {
+			Data struct {
+				Blocked int `json:"blocked"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			statusCh <- statusResult{err: err}
+			return
+		}
+		statusCh <- statusResult{blocked: resp.Data.Blocked}
+	}()
+
+	go func() {
+		data, code, err := do(ctx, "GET",
+			fmt.Sprintf("/profiles/%s/analytics/domains?from=-24h&status=blocked&limit=10", profileID), nil)
+		if err != nil {
+			domainCh <- domainResult{err: err}
+			return
+		}
+		if code != 200 {
+			domainCh <- domainResult{err: fmt.Errorf("nextdns analytics domains: %d", code)}
+			return
+		}
+		var resp struct {
+			Data []struct {
+				Name    string `json:"name"`
+				Queries int    `json:"queries"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			domainCh <- domainResult{err: err}
+			return
+		}
+		domains := make([]Domain, len(resp.Data))
+		for i, d := range resp.Data {
+			domains[i] = Domain{Name: d.Name, Queries: d.Queries}
+		}
+		domainCh <- domainResult{domains: domains}
+	}()
+
+	sr := <-statusCh
+	if sr.err != nil {
+		return nil, sr.err
 	}
-	if domainCode != 200 {
-		return nil, fmt.Errorf("nextdns analytics domains: %d: %s", domainCode, domainData)
+	dr := <-domainCh
+	if dr.err != nil {
+		return nil, dr.err
 	}
-	var domainResp struct {
-		Data []struct {
-			Name    string `json:"name"`
-			Queries int    `json:"queries"`
-		} `json:"data"`
-	}
-	if err := json.Unmarshal(domainData, &domainResp); err != nil {
-		return nil, err
-	}
-	domains := make([]Domain, len(domainResp.Data))
-	for i, d := range domainResp.Data {
-		domains[i] = Domain{Name: d.Name, Queries: d.Queries}
-	}
+
 	return &Analytics{
-		TotalBlocked: statusResp.Data.Blocked,
-		TopDomains:   domains,
+		TotalBlocked: sr.blocked,
+		TopDomains:   dr.domains,
 	}, nil
 }
 
 // Toggle adds (enabled=true) or removes (enabled=false) an item on a profile sub-path.
-// e.g. path = "parentalcontrol/services", id = "instagram"
-func Toggle(profileID, subPath, id string, enabled bool) error {
+func Toggle(ctx context.Context, profileID, subPath, id string, enabled bool) error {
 	path := fmt.Sprintf("/profiles/%s/%s", profileID, subPath)
 	var status int
 	var err error
 	if enabled {
-		_, status, err = do("POST", path, map[string]string{"id": id})
+		_, status, err = do(ctx, "POST", path, map[string]string{"id": id})
 	} else {
-		_, status, err = do("DELETE", fmt.Sprintf("%s/%s", path, id), nil)
+		_, status, err = do(ctx, "DELETE", fmt.Sprintf("%s/%s", path, id), nil)
 	}
 	if err != nil {
 		return err

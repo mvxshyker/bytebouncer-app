@@ -22,7 +22,7 @@ func Analytics(db *database.Pool) fiber.Handler {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "db error"})
 		}
 
-		analytics, err := services.GetAnalytics(user.ProfileID)
+		analytics, err := services.GetAnalytics(c.Context(), user.ProfileID)
 		if err != nil {
 			return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "failed to fetch analytics"})
 		}
